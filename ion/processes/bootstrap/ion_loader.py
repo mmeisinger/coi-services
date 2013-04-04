@@ -109,6 +109,7 @@ DEFAULT_CATEGORIES = [
     'Contact',
     'User',
     'Org',
+    #'Policy',
     'UserRole',
     'CoordinateSystem',
     'ParameterFunctions',
@@ -1014,6 +1015,70 @@ class IONLoader(ImmediateProcess):
             for org in ooi_orgs:
                 if not self._get_resource_obj(org[COL_ID]):
                     self._load_Org(org)
+
+    def _load_Policy(self, row):
+        if not self.CFG.get_safe("system.load_policy", False):
+            return
+
+        policy_obj = self._create_object_from_row("Policy", row, "p/")
+
+        pms_client = self._get_service_client("policy_management")
+        headers = self._get_op_headers(row)
+
+        policy_type	= row['policy_type']
+        preconditions = row['preconditions']
+        policy_rule	= row['policy_rule']
+        service_name = row['service_name']
+        process_name = row['process_name']
+        resource_id = row.get('resource_id', None)
+
+        # Create various types of policy
+        if policy_type == "CommonServiceAccessPolicy":
+            policy_id = pms_client.create_common_service_access_policy(
+                policy_name=policy_obj.name,
+                description=policy_obj.description,
+                policy_rule=policy_rule or policy_obj.definition,
+                headers=headers)
+
+        elif policy_type == "ServiceAccessPolicy" and service_name:
+            policy_id = pms_client.create_service_access_policy(
+                service_name=service_name,
+                policy_name=policy_obj.name,
+                description=policy_obj.description,
+                policy_rule=policy_rule or policy_obj.definition,
+                headers=headers)
+
+        elif policy_type == "ProcessOperationPreconditionPolicy" and process_name:
+            policy_id = pms_client.add_process_operation_precondition_policy(
+                process_name=process_name,
+                op="",
+                preconditions=preconditions,
+                headers=headers)
+
+        elif policy_type == "OperationPreconditionPolicy":
+            policy_id = pms_client.add_operation_precondition_policy(
+                process_name=process_name,
+                op="",
+                preconditions=preconditions,
+                headers=headers)
+
+        elif policy_type == "ResourceAccessPolicy" and resource_id:
+            policy_id = pms_client.create_resource_access_policy(
+                resource_id=resource_id,
+                policy_name=policy_obj.name,
+                description=policy_obj.description,
+                policy_rule=policy_rule or policy_obj.definition,
+                headers=headers)
+
+        elif policy_type == "Policy":
+            policy_id = pms_client.create_policy(
+                policy=policy_obj,
+                headers=headers)
+
+        self._register_id(row[COL_ID], policy_id, policy_obj)
+
+        # If needed for policy:
+        self._resource_assign_org(row, policy_id)
 
     def _load_UserRole(self, row):
         org_id = row["org_id"]
