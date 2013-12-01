@@ -85,6 +85,7 @@ from ion.agents.port.port_agent_process import PortAgentProcessType, PortAgentTy
 from ion.core.ooiref import OOIReferenceDesignator
 from ion.processes.bootstrap.ooi_loader import OOILoader
 from ion.processes.bootstrap.ui_loader import UILoader
+from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
 from ion.services.dm.utility.granule_utils import time_series_domain
 from ion.services.dm.utility.types import TypesManager
 from ion.util.datastore.resources import ResourceRegistryHelper
@@ -97,6 +98,9 @@ from coverage_model import NumexprFunction, PythonFunction, QuantityType, Parame
 
 from interface import objects
 from interface.objects import StreamAlertType, PortTypeEnum, StreamConfigurationType
+from interface.objects import ParameterContext as ParameterContextResource
+from interface.objects import ParameterDictionary as ParameterDictionaryResource
+from interface.objects import ParameterFunction
 
 from ooi.timer import Accumulator, Timer
 stats = Accumulator(persist=True)
@@ -228,6 +232,7 @@ class IONLoader(ImmediateProcess):
 
         self.idmapping = {}             # Mapping of current to new preload IDs
         self._category_info = []        # Keeps track of scanned scenario categories
+        self._post_data = {}            # Information to keep for category post-processors
 
     def on_start(self):
         cfg = self.CFG.get("cfg", None)
@@ -586,6 +591,14 @@ class IONLoader(ImmediateProcess):
                     log.error('error loading %s row: %r', category, row, exc_info=True)
                     raise
 
+            # Execute a category post-processing function if defined
+            catfunc_post = getattr(self, "_load_%s_post" % category, None)
+            if catfunc_post:
+                log.debug('Executing POST processing function for %s', category)
+                cat_post_data = self._post_data.get(category, {})
+                catfunc_post(cat_post_data)
+                self._post_data.pop(category, None)
+
             source_row_count = len(self.object_definitions.get(category, []))
             if t:
                 t.complete_step('preload.%s.load_row'%category)
@@ -764,6 +777,10 @@ class IONLoader(ImmediateProcess):
         if not silent:
             log.debug("_get_resource_obj(): No object found for '%s'", res_id)
         return None
+
+    def _get_post_data(self, category=None):
+        category = category or self._category
+        return self._post_data.setdefault(category, {})
 
     def _resource_exists(self, res_id):
         if not res_id:
@@ -1824,10 +1841,8 @@ Reason: %s
         func_expr = row['Function']
         owner     = row['Owner']
         args      = ast.literal_eval(row['Args'])
-        #kwargs    = row['Kwargs']
         descr     = row['Description']
 
-        dataset_management = self._get_service_client('dataset_management')
         func = None
         if ftype == 'NumexprFunction':
             func = NumexprFunction(row['Name'], func_expr, args)
@@ -1837,13 +1852,23 @@ Reason: %s
             self._conflict_report(row['ID'], row['Name'], 'Unsupported Function Type: %s' % ftype)
             return
 
-        func_id = dataset_management.create_parameter_function(name=name, parameter_function=func.dump(),
-                                                               description=descr, headers=self._get_system_actor_headers())
-        # Set alt_ids so that resource can be found in incremental preload runs
-        func_obj = self.container.resource_registry.read(func_id)
-        func_obj.alt_ids=['PRE:'+row[COL_ID]]
-        self.container.resource_registry.update(func_obj)
-        self._register_id(row[COL_ID], func_id, func_obj)
+        parameter_function = DatasetManagementService.numpy_walk(func.dump())
+        pf_res = ParameterFunction(name=name, parameter_function=parameter_function, description=descr)
+        pf_res.alt_ids = ['PRE:'+row[COL_ID]]
+        post_data = self._get_post_data()
+        post_data.setdefault("res", []).append(pf_res)
+        post_data.setdefault("rid", []).append(row[COL_ID])
+
+    def _load_ParameterFunctions_post(self, post_data):
+        if not post_data:
+            return
+        dataset_management = self._get_service_client('dataset_management')
+        res_ids = dataset_management.create_parameters_mult(parameter_function_list=post_data["res"],
+                                                            headers=self._get_system_actor_headers())
+        parameter_function_ids = res_ids["parameter_function_ids"]
+        for pfid, pf, pfalias in zip(parameter_function_ids, post_data["res"], post_data["rid"]):
+            pf._id = pfid
+            self._register_id(pfalias, pfid, pf)
 
     def _load_ParameterDefs(self, row):
         if self._row_exists(row):
@@ -1879,18 +1904,48 @@ Reason: %s
         # allow google doc to include more maintainable "key: value, key: value" instead of python "{ 'key': 'value', 'key': 'value' }"
         pmap = pmap if pmap.startswith('{') else repr(parse_dict(pmap))
 
-        if pfid and ptype!='function':
+        post_data = self._get_post_data()
+
+        def create_pctx_func(name='', parameter_context=None, description='', reference_urls=None,
+                             parameter_type='', internal_name='', value_encoding='', code_report='', units='',
+                             fill_value='', display_name='', parameter_function_id='', parameter_function_map='',
+                             standard_name='', ooi_short_name='', precision='', visible=True):
+
+            parameter_context = DatasetManagementService.numpy_walk(parameter_context)
+            pc_res = ParameterContextResource(name=name, parameter_context=parameter_context, description=description)
+            pc_res.reference_urls = reference_urls or []
+            pc_res.parameter_type = parameter_type
+            pc_res.internal_name = internal_name or name
+            pc_res.value_encoding = value_encoding
+            pc_res.code_report = code_report or ''
+            pc_res.units = units
+            pc_res.fill_value = fill_value
+            pc_res.display_name = display_name
+            pc_res.parameter_function_id = parameter_function_id
+            pc_res.parameter_function_map = parameter_function_map
+            pc_res.standard_name = standard_name
+            pc_res.ooi_short_name = ooi_short_name
+            pc_res.precision = precision or '5'
+            pc_res.visible = visible
+
+            post_data.setdefault("res", []).append(pc_res)
+            post_data.setdefault("rid", []).append(None)
+
+            pc_res._id = create_unique_resource_id()
+            return pc_res._id
+
+        if pfid and ptype != 'function':
             log.warn('Parameter %s (%s) has type %s, did not expect function %s', row['ID'], name, ptype, pfid)
             #validate parameter type
         try:
-            tm = TypesManager(dataset_management, self.resource_ids, self.resource_objs)
-            param_type = tm.get_parameter_type(ptype, encoding,code_set,pfid, pmap)
+            tm = TypesManager(dataset_management, self.resource_ids, self.resource_objs, create_pctx_func=create_pctx_func)
+            param_type = tm.get_parameter_type(ptype, encoding, code_set, pfid, pmap)
             context = ParameterContext(name=name, param_type=param_type)
             context.uom = uom
             try:
                 tm.get_unit(uom)
             except UdunitsError as e:
-                log.warning('Parameter %s (%s) has invalid units: %s', name,param_id, uom)
+                log.warning('Parameter %s (%s) has invalid units: %s', name, param_id, uom)
             context.fill_value = tm.get_fill_value(fill_value, encoding, param_type)
             context.reference_urls = references
             context.internal_name = name
@@ -1906,7 +1961,7 @@ Reason: %s
                     context.document_key = ''
                 else:
                     if '||' in lookup_value:
-                        context.lookup_value,context.document_key = lookup_value.split('||')
+                        context.lookup_value, context.document_key = lookup_value.split('||')
                     else:
                         context.lookup_value = name
                         context.document_key = lookup_value
@@ -1933,16 +1988,14 @@ Reason: %s
                 if context.ooi_short_name in dps:
                     dp = dps[context.ooi_short_name]
                     qc_fields = [v for k,v in qc_map.iteritems() if dp[k] == 'applicable']
-                    if qc_fields and not qc: # If the column wasn't filled out but SAF says it should be there, just use the OOI Short Name
-                        log.warning("Enabling QC for %s (%s) based on SAF requirement but QC-identifier wasn't specified.", name, row[COL_ID])
+                    if qc_fields and not qc:  # If the column wasn't filled out but SAF says it should be there, just use the OOI Short Name
+                        log.warn("Enabling QC for %s (%s) based on SAF requirement but QC-identifier wasn't specified.", name, row[COL_ID])
                         qc = sname
-                    
-
 
             if qc:
                 try:
                     if isinstance(context.param_type, (QuantityType, ParameterFunctionType)):
-                        context.qc_contexts = tm.make_qc_functions(name,qc,self._register_id, qc_fields)
+                        context.qc_contexts = tm.make_qc_functions(name, qc, None, qc_fields)
                 except KeyError:
                     pass
 
@@ -1950,7 +2003,7 @@ Reason: %s
             log.exception(e.message)
             self._conflict_report(row['ID'], row['Name'], e.message)
             return
-        except:
+        except Exception:
             log.exception('Could not load the following parameter definition: %s', row)
             return
 
@@ -1961,47 +2014,79 @@ Reason: %s
         except Exception as e:
             self._conflict_report(row['ID'], row['Name'], e.message)
             return
-        try:
-            creation_args = dict(
-                name=name, parameter_context=context_dump,
-                description=description,
-                reference_urls=[references],
-                parameter_type=ptype,
-                internal_name=name,
-                value_encoding=encoding,
-                code_report=code_set,
-                units=uom,
-                fill_value=fill_value,
-                display_name=display_name,
-                parameter_function_map=pmap,
-                standard_name=std_name,
-                ooi_short_name=sname,
-                precision=precision,
-                visible=visible,
-                headers=self._get_system_actor_headers())
-            if pfid:
-                try:
-                    creation_args['parameter_function_id'] = self.resource_ids[pfid]
-                except KeyError:
-                    pass
-            context_id = dataset_management.create_parameter_context(**creation_args)
-            context_obj = self.container.resource_registry.read(context_id)
-            context_obj.alt_ids = ['PRE:'+row[COL_ID]]
-            self.container.resource_registry.update(context_obj)
-        except AttributeError as e:
-            if e.message == "'dict' object has no attribute 'read'":
-                self._conflict_report(row['ID'], row['Name'], 'Something is not JSON compatible.')
-                return
-            else:
-                self._conflict_report(row['ID'], row['Name'], e.message)
-                return
-        self._register_id(row[COL_ID], context_id, context_obj)
+
+        # Defer to post processing
+        parameter_context = DatasetManagementService.numpy_walk(context_dump)
+        pc_res = ParameterContextResource(name=name, parameter_context=parameter_context, description=description)
+        pc_res.reference_urls = [references]
+        pc_res.parameter_type = ptype
+        pc_res.internal_name = name
+        pc_res.value_encoding = encoding
+        pc_res.code_report = code_set
+        pc_res.units = uom
+        pc_res.fill_value = fill_value
+        pc_res.display_name = display_name
+        if pfid:
+            try:
+                pc_res.parameter_function_id = self.resource_ids[pfid]
+            except KeyError:
+                pass
+        pc_res.parameter_function_map = pmap
+        pc_res.standard_name = std_name
+        pc_res.ooi_short_name = sname
+        pc_res.precision = precision
+        pc_res.visible = visible
+        pc_res.alt_ids = ['PRE:'+row[COL_ID]]
+
+        post_data.setdefault("res", []).append(pc_res)
+        post_data.setdefault("rid", []).append(row[COL_ID])
+
+    def _load_ParameterDefs_post(self, post_data):
+        if not post_data:
+            return
+        dataset_management = self._get_service_client('dataset_management')
+        res_ids = dataset_management.create_parameters_mult(parameter_context_list=post_data["res"],
+                                                            headers=self._get_system_actor_headers())
+        parameter_context_ids = res_ids["parameter_context_ids"]
+        for pcid, pc, pcalias in zip(parameter_context_ids, post_data["res"], post_data["rid"]):
+            pc._id = pcid
+            self._register_id(pcalias or pcid, pcid, pc)
 
     def _load_ParameterDictionary(self, row):
         if self._row_exists(row):
             return
+
+        post_data = self._get_post_data()
+
+        def create_pctx_func(name='', parameter_context=None, description='', reference_urls=None,
+                             parameter_type='', internal_name='', value_encoding='', code_report='', units='',
+                             fill_value='', display_name='', parameter_function_id='', parameter_function_map='',
+                             standard_name='', ooi_short_name='', precision='', visible=True):
+
+            parameter_context = DatasetManagementService.numpy_walk(parameter_context)
+            pc_res = ParameterContextResource(name=name, parameter_context=parameter_context, description=description)
+            pc_res.reference_urls = reference_urls or []
+            pc_res.parameter_type = parameter_type
+            pc_res.internal_name = internal_name or name
+            pc_res.value_encoding = value_encoding
+            pc_res.code_report = code_report or ''
+            pc_res.units = units
+            pc_res.fill_value = fill_value
+            pc_res.display_name = display_name
+            pc_res.parameter_function_id = parameter_function_id
+            pc_res.parameter_function_map = parameter_function_map
+            pc_res.standard_name = standard_name
+            pc_res.ooi_short_name = ooi_short_name
+            pc_res.precision = precision or '5'
+            pc_res.visible = visible
+
+            post_data.setdefault("res_pc", []).append(pc_res)
+
+            pc_res._id = create_unique_resource_id()
+            return pc_res._id
+
         dataset_management = self._get_service_client('dataset_management')
-        types_manager = TypesManager(dataset_management, self.resource_ids, self.resource_objs)
+        types_manager = TypesManager(dataset_management, self.resource_ids, self.resource_objs, create_pctx_func=create_pctx_func)
         if row['SKIP']:
             self._conflict_report(row['ID'], row['name'], row['SKIP'])
             return
@@ -2040,9 +2125,10 @@ Reason: %s
                 for val in coefficients:
                     context_ids[val] = 0
 
-                if hasattr(context,'qc_contexts'):
+                if hasattr(context, 'qc_contexts'):
                     for qc in context.qc_contexts:
                         if qc not in self.resource_ids:
+                            log.warn("Referenced QC param not in preload objects: %s", qc)
                             obj = dataset_management.read_parameter_context(qc)
                             self._register_id(qc, qc, obj)
                     definitions.extend(context.qc_contexts)
@@ -2056,19 +2142,40 @@ Reason: %s
         if not context_ids:
             log.warning('No valid parameters: %s', row['name'])
             return
-        try:
-            pdict_id = dataset_management.create_parameter_dictionary(name=name, parameter_context_ids=context_ids.keys(),
-                                                                      temporal_context=temporal_parameter_name,
-                                                                      headers=self._get_system_actor_headers())
-            # Set alt_ids so that resource can be found in incremental preload runs
-            pdict = self.container.resource_registry.read(pdict_id)
-            pdict.alt_ids = ['PRE:'+row[COL_ID]]
-            self.container.resource_registry.update(pdict)
-        except Exception:
-            log.exception('%s has a problem', row['name'])
-            return
 
-        self._register_id(row[COL_ID], pdict_id, pdict)
+        # Defer to post
+        pd_res = ParameterDictionaryResource(name=name, temporal_context=temporal_parameter_name)
+        pd_res.alt_ids = ['PRE:'+row[COL_ID]]
+        pd_res._id = create_unique_resource_id()
+
+        post_data.setdefault("res", []).append(pd_res)
+        post_data.setdefault("rid", []).append(row[COL_ID])
+        post_data.setdefault("links", {})[pd_res._id] = context_ids.keys()
+
+    def _load_ParameterDictionary_post(self, post_data):
+        if not post_data:
+            return
+        # TODO: Check that names are not reoccurring
+        # TODO: Check that ctx dicts are equal
+
+        dataset_management = self._get_service_client('dataset_management')
+        # Create param ctx for combined QC params
+        # Create param dicts
+        # Create associations to param ctx
+        res_ids = dataset_management.create_parameters_mult(parameter_context_list=post_data.get("res_pc", []),
+                                                            parameter_dictionary_list=post_data["res"],
+                                                            parameter_dictionary_assocs=post_data["links"],
+                                                            headers=self._get_system_actor_headers())
+        parameter_context_ids = res_ids["parameter_context_ids"]
+        for pcid, pc in zip(parameter_context_ids, post_data.get("res_pc", [])):
+            pc._id = pcid
+            self._register_id(pcid, pcid, pc)
+
+        parameter_dictionary_ids = res_ids["parameter_dictionary_ids"]
+        for pdid, pd, pdalias in zip(parameter_dictionary_ids, post_data["res"], post_data["rid"]):
+            pd._id = pdid
+            self._register_id(pdalias, pdid, pd)
+
 
     def _load_StreamDefinition(self, row):
         if self._row_exists(row):

@@ -448,6 +448,54 @@ class DatasetManagementService(BaseDatasetManagementService):
 
 #--------
 
+    def create_parameters_mult(self, parameter_function_list=None, parameter_context_list=None,
+                               parameter_dictionary_list=None, parameter_dictionary_assocs=None):
+        if parameter_function_list and not all([True for pf in parameter_function_list if pf.type_ != RT.ParameterFunction]):
+            raise BadRequest("parameter_function_list argument contains unexpected type")
+        if parameter_context_list and not all([True for pc in parameter_context_list if pc.type_ != RT.ParameterContext]):
+            raise BadRequest("parameter_context_list argument contains unexpected type")
+        if parameter_dictionary_list and not all([True for pd in parameter_dictionary_list if pd.type_ != RT.ParameterDictionary]):
+            raise BadRequest("parameter_dictionary_list argument contains unexpected type")
+
+        res_ids = dict(parameter_function_ids=[], parameter_context_ids=[], parameter_dictionary_ids=[])
+        if parameter_function_list:
+            for pf in parameter_function_list:
+                validate_true(pf.name, 'Name field may not be empty')
+            pf_ids = self.clients.resource_registry.create_mult(parameter_function_list)
+            res_ids["parameter_function_ids"] = [o[0] for o in pf_ids]
+
+        if parameter_context_list:
+            pf_list = []
+            for pc in parameter_context_list:
+                validate_true(pc.name, 'Name field may not be empty')
+                pf_list.append(pc.parameter_function_id)
+            pc_ids = self.clients.resource_registry.create_mult(parameter_context_list)
+            pc_ids = [o[0] for o in pc_ids]
+            res_ids["parameter_context_ids"] = pc_ids
+
+            pf_assocs = [(pcid, PRED.hasParameterFunction, pfid) for (pcid, pfid) in zip(pc_ids, pf_list) if pfid]
+            self.clients.resource_registry.create_association_mult(pf_assocs)
+
+        if parameter_dictionary_list:
+            for pd in parameter_dictionary_list:
+                validate_true(pd.name, 'Name field may not be empty.')
+
+            pd_ids = self.clients.resource_registry.create_mult(parameter_dictionary_list)
+            pd_ids = [o[0] for o in pd_ids]
+            res_ids["parameter_dictionary_ids"] = pd_ids
+
+        if parameter_dictionary_assocs:
+            pc_assocs = []
+            for pdid, pc_list in parameter_dictionary_assocs.iteritems():
+                for pcid in pc_list:
+                    pc_assocs.append((pdid, PRED.hasParameterContext, pcid))
+
+            self.clients.resource_registry.create_association_mult(pc_assocs)
+
+        return res_ids
+
+#--------
+
     def _link_pcr_to_pdr(self, pcr_id, pdr_id):
         self.clients.resource_registry.create_association(subject=pdr_id, predicate=PRED.hasParameterContext,object=pcr_id)
 

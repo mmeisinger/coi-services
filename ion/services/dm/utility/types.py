@@ -31,10 +31,11 @@ from uuid import uuid4
 class TypesManager(object):
     system = System(path=CFG.get_safe('units', 'res/config/units/udunits2.xml'))
 
-    def __init__(self, dataset_management_client, resource_ids, resource_objs):
+    def __init__(self, dataset_management_client, resource_ids, resource_objs, create_pctx_func=None):
         self.dataset_management = dataset_management_client
         self.resource_ids = resource_ids
         self.resource_objs = resource_objs
+        self.create_pctx_func = create_pctx_func or self.dataset_management.create_parameter_context
 
     def get_array_type(self,parameter_type=None, encoding=None):
         if encoding in ('str', '', 'opaque'):
@@ -158,7 +159,7 @@ class TypesManager(object):
         pc.document_key = document_key
         pc.uom = '1'
         pc.visible = False
-        ctxt_id = self.dataset_management.create_parameter_context(name=placeholder, parameter_context=pc.dump())
+        ctxt_id = self.create_pctx_func(name=placeholder, parameter_context=pc.dump())
         return ctxt_id, placeholder
 
 
@@ -175,13 +176,13 @@ class TypesManager(object):
         placeholder = value.lower()
         # Check to see if this coefficient exists already
 
-        hits, _ = Container.instance.resource_registry.find_resources(name=placeholder, restype=RT.ParameterContext, id_only=True)
+        hits = [ro._id for ro in self.resource_objs.values() if ro.type_ == RT.ParameterContext and ro.name == placeholder]
         if hits:
             return hits[0], placeholder
 
         pc = ParameterContext(name=placeholder, param_type=SparseConstantType(value_encoding='float64'), fill_value=-9999.)
         pc.uom = '1'
-        ctxt_id = self.dataset_management.create_parameter_context(name=placeholder, parameter_context=pc.dump())
+        ctxt_id = self.create_pctx_func(name=placeholder, parameter_context=pc.dump())
         return ctxt_id, placeholder
 
 
@@ -229,10 +230,8 @@ class TypesManager(object):
     def evaluate_qc(self):
         pass
 
-        
-    @memoize_lru(maxsize=100)
-    def find_function(self,name):
-        res_obj, _ = Container.instance.resource_registry.find_resources(name=name, restype=RT.ParameterFunction, id_only=False)
+    def find_function(self, name):
+        res_obj = [fo for fo in self.resource_objs.values() if fo.type_ == RT.ParameterFunction and fo.name == name]
         if res_obj:
             return res_obj[0]._id, AbstractFunction.load(res_obj[0].parameter_function)
         else:
@@ -259,7 +258,7 @@ class TypesManager(object):
     def find_localrange_test(self):
         return self.find_function('dataqc_localrangetest')
 
-    def make_qc_functions(self, name, data_product, registration_function, qc_fields=None):
+    def make_qc_functions(self, name, data_product, registration_function=None, qc_fields=None):
         contexts = []
 
         if qc_fields is None:
@@ -267,7 +266,7 @@ class TypesManager(object):
                             self.make_grt_qc,
                             self.make_spike_qc,
                             self.make_stuckvalue_qc,
-                            self.make_trendtest_qc, # was not supported
+                            self.make_trendtest_qc,  # was not supported
                             self.make_gradienttest_qc,
                             self.make_localrange_qc,
                             ]
@@ -288,12 +287,13 @@ class TypesManager(object):
 
         for factory in qc_factories:
             try:
-                ctxt_id, pc = factory(name,data_product)
+                ctxt_id, pc = factory(name, data_product)
             except KeyError as e:
                 log.error(e.message)
                 continue
             contexts.append(ctxt_id)
-            registration_function(ctxt_id, ctxt_id, ParameterContextResource(name=pc.name, parameter_context=pc.dump()))
+            if registration_function:
+                registration_function(ctxt_id, ctxt_id, ParameterContextResource(name=pc.name, parameter_context=pc.dump()))
 
         return contexts
 
@@ -315,7 +315,7 @@ class TypesManager(object):
         pc.ooi_short_name = '%s_GLBLRNG_QC' % dp_name
         pc.display_name = '%s Global Range Test Quality Control Flag' % dp_name
         pc.description = "The OOI Global Range quality control algorithm generates a QC flag for the input data point indicating whether it falls within a given range."
-        ctxt_id = self.dataset_management.create_parameter_context(name='%s_glblrng_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
+        ctxt_id = self.create_pctx_func(name='%s_glblrng_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
         return ctxt_id, pc
 
     def make_spike_qc(self, name, data_product):
@@ -335,7 +335,7 @@ class TypesManager(object):
 
         pc.description = "The OOI Spike Test quality control algorithm generates a flag for individual data values that deviate significantly from surrounding data values."
 
-        ctxt_id = self.dataset_management.create_parameter_context(name='%s_spketst_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
+        ctxt_id = self.create_pctx_func(name='%s_spketst_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
         return ctxt_id, pc
 
     def make_stuckvalue_qc(self, name, data_product):
@@ -354,7 +354,7 @@ class TypesManager(object):
         pc.display_name = '%s Stuck Value Test Quality Control Flag' % dp_name
         pc.description =  'The OOI Stuck Value Test quality control algorithm generates a flag for repeated occurrence of one value in a time series.'
 
-        ctxt_id = self.dataset_management.create_parameter_context(name='%s_stuckvl_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
+        ctxt_id = self.create_pctx_func(name='%s_stuckvl_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
         return ctxt_id, pc
 
     def make_trendtest_qc(self, name, data_product):
@@ -374,7 +374,7 @@ class TypesManager(object):
         pc.ooi_short_name = '%s_TRNDTST_QC' % dp_name
         pc.display_name = '%s Trend Test Test Quality Control Flag' % dp_name
         pc.description = 'The OOI Trend Test quality control algorithm generates flags on data values within a time series where a significant fraction of the variability in the time series can be explained by a drift, where the drift is assumed to be a polynomial of specified order.'
-        ctxt_id = self.dataset_management.create_parameter_context(name='%s_trndtst_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
+        ctxt_id = self.create_pctx_func(name='%s_trndtst_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
         return ctxt_id, pc
 
     def make_gradienttest_qc(self, name, data_product):
@@ -396,7 +396,7 @@ class TypesManager(object):
         pc.ooi_short_name = '%s_GRADTST_QC' % dp_name
         pc.display_name = '%s Gradient Test Quality Control Flag' % dp_name
         pc.description = 'The OOI Gradient Test is an automated quality control algorithm used on various OOI data products. This automated algorithm generates flags for data points according to whether changes between successive points are within a pre-determined range.'
-        ctxt_id = self.dataset_management.create_parameter_context(name='%s_gradtst_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
+        ctxt_id = self.create_pctx_func(name='%s_gradtst_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
         return ctxt_id, pc
     
     def make_localrange_qc(self, name, data_product):
@@ -417,7 +417,7 @@ class TypesManager(object):
         pc.ooi_short_name = '%s_LOCLRNG_QC' % dp_name
         pc.display_name = '%s Local Range Test Quality Control Flag' % dp_name
         pc.description = 'The OOI Local Range Test is the computation to test whether a given data point falls within pre-defined ranges.'
-        ctxt_id = self.dataset_management.create_parameter_context(name='%s_loclrng_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
+        ctxt_id = self.create_pctx_func(name='%s_loclrng_qc' % dp_name.lower(), parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
         return ctxt_id, pc
 
     def make_propagate_qc(self,inputs):
@@ -437,7 +437,7 @@ class TypesManager(object):
         pc.ooi_short_name = 'CMBNFLG_QC' 
         pc.display_name = 'Combined Data Quality Control Flag' 
         pc.description = 'The purpose of this computation is to produce a single merged QC flag from a set of potentially many flags.'
-        ctxt_id = self.dataset_management.create_parameter_context(name='cmbnflg_qc', parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
+        ctxt_id = self.create_pctx_func(name='cmbnflg_qc', parameter_type='function', parameter_context=pc.dump(), parameter_function_id=pfunc_id, ooi_short_name=pc.ooi_short_name, units='1', value_encoding='int8', display_name=pc.display_name, description=pc.description)
         return ctxt_id, pc
 
 
@@ -483,5 +483,4 @@ class TypesManager(object):
 
     def get_unit(self, uom):
         return Unit(uom, system=self.system)
-
 
