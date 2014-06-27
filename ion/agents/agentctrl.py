@@ -16,10 +16,6 @@ Invoke via command line like this:
     bin/pycc -x ion.agents.agentctrl.AgentControl preload_id='CP02PMUI-WF001_PD' op=start
     and others (see below and Confluence page)
 
-TODO:
-- Force terminate agents and clean up
-- Change owner of resource
-- Change contact info, metadata of resource based on spreadsheet
 """
 
 __author__ = 'Michael Meisinger, Ian Katz, Bill French, Luke Campbell'
@@ -32,14 +28,12 @@ import time
 
 from pyon.agent.agent import ResourceAgentClient, ResourceAgentEvent
 from pyon.core.object import IonObjectBase
-from pyon.public import RT, log, PRED, OT, ImmediateProcess, BadRequest, NotFound, LCS, AS, EventPublisher, dict_merge, IonObject
+from pyon.public import RT, log, PRED, OT, ImmediateProcess, BadRequest, NotFound, LCS, LCE, AS, EventPublisher, dict_merge, IonObject
 
 from ion.core.includes.mi import DriverEvent
 from ion.services.dm.inventory.dataset_management_service import DatasetManagementService
 from ion.services.sa.observatory.deployment_util import DeploymentUtil
 from ion.services.sa.observatory.observatory_util import ObservatoryUtil
-from ion.services.sa.observatory.deployment_util import DeploymentUtil
-
 from ion.util.parse_utils import parse_dict, get_typed_value
 from ion.util.datastore.resuse import ResourceUseInfo
 
@@ -78,7 +72,7 @@ ARG_HELP = {
     "facility":     "a facility (Org) identified by governance name, preload id, name or uuid",
     "role":         "a user role identified by governance name, preload id, name or uuid within the facility (Org)",
     "user":         "a user or actor identified by name, preload ir or uuid",
-    "agent":        "comma separate list of preload ids of agent definitions",
+    "agent":        "comma separated list of preload ids of agent definitions",
 }
 
 RES_ARG_LIST = ["resource_id", "preload_id"]
@@ -127,7 +121,7 @@ OP_HELP = [
         args=DEV_ARG_LIST + COMMON_ARG_LIST)),
     ("set_calibration", dict(
         opmsg="Add or replace calibration information for a device and its data products",
-        args=DEV_ARG_LIST + COMMON_ARG_LIST)),
+        args=DEV_ARG_LIST + ["cfg"] + COMMON_ARG_LIST)),
     ("clear_saved_state", dict(
         opmsg="Clear out the saved_agent_state in agent instance resource",
         args=DEV_ARG_LIST + COMMON_ARG_LIST)),
@@ -179,9 +173,6 @@ OP_HELP = [
         args=DEV_ARG_LIST + COMMON_ARG_LIST)),
     ("delete_all_data", dict(
         opmsg="Remove all device related DataProduct, StreamDefinition, Dataset, resources and coverages",
-        args=DEV_ARG_LIST + COMMON_ARG_LIST)),
-    ("delete_all_device", dict(
-        opmsg="Remove all device related resources and all from delete_all_data",
         args=DEV_ARG_LIST + COMMON_ARG_LIST)),
     ("delete_all_device", dict(
         opmsg="Remove all device related resources and all from delete_all_data",
@@ -294,7 +285,7 @@ class AgentControl(ImmediateProcess):
 
             resource = None
             try:
-                log.debug("Looking for a resource with id %s", dataset_name)
+                log.debug("Looking for a resource with id %s", resource_name)
                 resource = self.rr.read(resource_name)
             except NotFound:
                 pass
@@ -498,8 +489,18 @@ class AgentControl(ImmediateProcess):
         if ai_obj.type_ == RT.ExternalDatasetAgentInstance:
             dams = DataAcquisitionManagementServiceProcessClient(process=self)
             if not self.dryrun:
-                dams.start_external_dataset_agent_instance(agent_instance_id, headers=self._get_system_actor_headers(),
-                                                           timeout=self.timeout)
+                try:
+                    dams.start_external_dataset_agent_instance(agent_instance_id, headers=self._get_system_actor_headers(),
+                                                               timeout=self.timeout)
+                except BadRequest as ex:
+                    if "failed to launch in " in ex.message:
+                        log.info(" continuing to wait for agent to appear...")
+                        import gevent
+                        gevent.sleep(10)
+                        client = ResourceAgentClient(resource_id, process=self)
+                    else:
+                        raise
+
         elif ai_obj.type_ == RT.InstrumentAgentInstance:
             ims = InstrumentManagementServiceProcessClient(process=self)
             if not self.dryrun:
@@ -702,21 +703,32 @@ class AgentControl(ImmediateProcess):
 
                 attr_val = getattr(res_obj, attr_name)
                 if isinstance(attr_cfg, dict) and isinstance(attr_val, IonObjectBase):
-                    # TODO: Nested objects
+                    # Attribute type is IonObject
+                    # TODO: Objects nested in lists, dicts or other objects
                     for an, av in attr_cfg.iteritems():
-                        setattr(attr_val, an, av)
+                        if hasattr(attr_val, an):
+                            if self.verbose:
+                                log.debug("Resource %s attribute %s.%s OLD: %s", resource_id, attr_name, an, getattr(attr_val, an))
+                                log.debug("Resource %s attribute %s.%s NEW: %s", resource_id, attr_name, an, av)
+                            setattr(attr_val, an, av)
                 elif isinstance(attr_cfg, dict) and "_replace" in attr_cfg:
+                    # Replace an attribute dict
                     attr_cfg.pop("_replace")
                     if self.verbose:
-                        log.debug("Change resource %s attribute %s: OLD=%s NEW=%s", resource_id, attr_name, getattr(res_obj, attr_name), attr_cfg)
+                        log.debug("Resource %s attribute %s OLD: %s", resource_id, attr_name, getattr(res_obj, attr_name))
+                        log.debug("Resource %s attribute %s NEW: %s", resource_id, attr_name, attr_cfg)
                     setattr(res_obj, attr_name, attr_cfg)
                 elif isinstance(attr_cfg, dict):
+                    # Modify an attribute dict
                     if self.verbose:
-                        log.debug("Change resource %s attribute %s: OLD=%s NEW=%s", resource_id, attr_name, getattr(res_obj, attr_name), dict_merge(attr_val, attr_cfg))
+                        log.debug("Resource %s attribute %s OLD: %s", resource_id, attr_name, getattr(res_obj, attr_name))
+                        log.debug("Resource %s attribute %s NEW: %s", resource_id, attr_name, dict_merge(attr_val, attr_cfg))
                     dict_merge(attr_val, attr_cfg, inplace=True)
                 else:
+                    # Modify an attribute simple type
                     if self.verbose:
-                        log.debug("Change resource %s attribute %s: OLD=%s NEW=%s", resource_id, attr_name, getattr(res_obj, attr_name), attr_cfg)
+                        log.debug("Resource %s attribute %s OLD: %s", resource_id, attr_name, getattr(res_obj, attr_name))
+                        log.debug("Resource %s attribute %s NEW: %s", resource_id, attr_name, attr_cfg)
                     setattr(res_obj, attr_name, attr_cfg)
 
     def config_instance(self, agent_instance_id, resource_id):
@@ -1343,7 +1355,7 @@ class AgentControl(ImmediateProcess):
             if self.verbose:
                 log.debug("Create dataset for data product %s", dp_obj._id)
             if not self.dryrun:
-                dpms.create_dataset_for_data_product(dp_obj._id, headers=self._get_system_actor_headers())
+                dpms.create_dataset_for_data_product(dp_obj._id, headers=self._get_system_actor_headers(), timeout=self.timeout)
 
         log.info("Checked datasets for device %s '%s': %s", resource_id, res_obj.name, len(dp_objs))
 
@@ -1564,7 +1576,7 @@ class AgentControl(ImmediateProcess):
         if res_pre_id:
             self._set_alt_id(newres_obj, "PRE:" + resnew_pre_id)
         newres_obj.name = res_obj.name + " (cloned)"
-        newres_obj.description = "Cloned from %s" % res_obj._id
+        newres_obj.description = ""
 
         return newres_obj, res_pre_id, resnew_pre_id
 
@@ -1623,6 +1635,14 @@ class AgentControl(ImmediateProcess):
 
         # Share in Orgs
         self._clone_org_share(resource_id, newdev_id)
+
+        # Device lcstate
+        # ims = InstrumentManagementServiceProcessClient(process=self)
+        # if res_obj.type_ == RT.InstrumentDevice:
+        #     ims.execute_instrument_device_lifecycle(newdev_id, LCE.INTEGRATE)
+        # else:
+        #     ims.execute_platform_device_lifecycle(newdev_id, LCE.INTEGRATE)
+        self.rr.execute_lifecycle_transition(newdev_id, LCE.INTEGRATE)
 
         return newdev_id, newdev_obj
 
@@ -1727,6 +1747,8 @@ class AgentControl(ImmediateProcess):
 
         # Share in Orgs
         self._clone_org_share(dp_obj._id, newdp_id)
+
+        dpms.execute_data_product_lifecycle(newdp_id, LCE.DEPLOY)
 
         # Associations hasOutputProduct
         if device_id:
