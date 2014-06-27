@@ -221,6 +221,7 @@ class IONLoader(ImmediateProcess):
         self.resource_ids = {}          # Holds a mapping of preload IDs to internal resource ids
         self.resource_objs = {}         # Holds a mapping of preload IDs to the actual resource objects
         self.resource_assocs = {}       # Holds a mapping of existing associations list by predicate
+        self.resource_clones = None     # Holds a mapping of resource ID (original) to a list of clone resource IDs
 
         self.constraint_defs = {}       # alias -> value for refs, since not stored in DB
         self.contact_defs = {}          # alias -> value for refs, since not stored in DB
@@ -802,6 +803,14 @@ class IONLoader(ImmediateProcess):
             log.debug("Resource/row %s/%s exists. Ignore with no update", self._category, row[COL_ID])
             return True
         return False
+
+    def _get_alt_id(self, res_obj, alt_ns):
+        """Return a resource object's alt id for a given namespace, or None"""
+        # TODO: Move into IonObjectBase (compied from agentctrl)
+        alt_ns = alt_ns or "_"
+        alt_ids = [aid[len(alt_ns) + 1:] for aid in res_obj.alt_ids if aid.startswith(alt_ns + ":")]
+        if alt_ids:
+            return alt_ids[0]
 
     def _update_resource_obj(self, res_id):
         """Updates an existing resource object"""
@@ -1726,6 +1735,7 @@ class IONLoader(ImmediateProcess):
     def _load_PlatformSite_OOI(self):
         subsite_objs = self.ooi_loader.get_type_assets("subsite")
         ssite_objs = self.ooi_loader.get_type_assets("ssite")
+        nodetype_objs = self.ooi_loader.get_type_assets("nodetype")
 
         def _load_platform(ooi_id, ooi_obj):
             ooi_rd = OOIReferenceDesignator(ooi_id)
@@ -1775,7 +1785,14 @@ class IONLoader(ImmediateProcess):
 
             newrow = {}
             newrow[COL_ID] = ooi_id
-            newrow['ps/name'] = ooi_obj.get('name', ooi_id)
+            # Exception for Coastal Glider names which should have serial number in them if existing
+            firstdev_obj = self._get_resource_obj(ooi_id + "_PD", silent=True)
+            if ooi_rd.node_type == "GL" and ooi_rd.array.startswith("C") and firstdev_obj and \
+                    firstdev_obj.serial_number and not "changeme" in firstdev_obj.serial_number:
+                nodetype_obj = nodetype_objs[ooi_rd.node_type]
+                newrow['ps/name'] = "%s serial# %s" % (nodetype_obj["name"], firstdev_obj.serial_number)
+            else:
+                newrow['ps/name'] = ooi_obj.get('name', ooi_id)
             newrow['ps/alt_ids'] = "['OOI:" + ooi_id + "']"
             newrow['ps/local_name'] = ooi_obj['local_name']
             newrow['ps/reference_designator'] = ooi_id
@@ -1874,6 +1891,7 @@ class IONLoader(ImmediateProcess):
         node_objs = self.ooi_loader.get_type_assets("node")
         class_objs = self.ooi_loader.get_type_assets("class")
         series_objs = self.ooi_loader.get_type_assets("series")
+        nodetype_objs = self.ooi_loader.get_type_assets("nodetype")
 
         for inst_id, inst_obj in inst_objs.iteritems():
             ooi_rd = OOIReferenceDesignator(inst_id)
@@ -1915,8 +1933,14 @@ class IONLoader(ImmediateProcess):
             inst_name = "%s (%s-%s)" % (class_obj['name'], series_obj['Class'], series_obj['Series'])
             newrow = {}
             newrow[COL_ID] = inst_id
-            #newrow['is/name'] = inst_name
-            newrow['is/name'] = "%s on %s" % (class_objs[ooi_rd.inst_class]['alt_name'], node_objs[ooi_rd.node_rd]['name'])
+            # Exception for Coastal Glider names which should have serial number in them if existing
+            firstdev_obj = self._get_resource_obj(inst_id + "_ID", silent=True)
+            if ooi_rd.node_type == "GL" and ooi_rd.array.startswith("C") and firstdev_obj and \
+                    firstdev_obj.serial_number and not "changeme" in firstdev_obj.serial_number:
+                nodetype_obj = nodetype_objs[ooi_rd.node_type]
+                newrow['is/name'] = "%s on %s serial# %s" % (class_objs[ooi_rd.inst_class]['alt_name'], nodetype_obj["name"], firstdev_obj.serial_number)
+            else:
+                newrow['is/name'] = "%s on %s" % (class_objs[ooi_rd.inst_class]['alt_name'], node_objs[ooi_rd.node_rd]['name'])
             newrow['is/description'] = "Instrument: %s" % inst_id
             newrow['is/alt_ids'] = "['OOI:" + inst_id + "']"
             newrow['is/local_name'] = inst_name
@@ -2370,6 +2394,38 @@ Reason: %s
         if needupdate:
             self._update_resource_obj(device_id)
 
+    def _update_clone(self, device_id, update_func):
+        """Given a device resource id, find all clones and apply update function to them"""
+        if self.resource_clones is None:
+            clone_objs, _ = self.container.resource_registry.find_resources_ext(alt_id_ns="CLONE", id_only=False)
+            self.resource_clones = {}
+            [self.resource_clones.setdefault(self._get_alt_id(co, "CLONE"), []).append(co) for co in clone_objs]
+            log.info("Loaded information about %s cloned resources", len(clone_objs))
+        dev_clones = self.resource_clones.get(device_id, None)
+        dev_obj = self._get_resource_obj(device_id)
+        if not dev_obj or not dev_clones:
+            return
+        for dev_clone in dev_clones:
+            need_update = update_func(dev_obj, dev_clone)
+            if need_update:
+                self.container.resource_registry.update(dev_clone)
+                log.debug("Updating %s %s clone (pre=%s id=%s): '%s'", dev_obj.type_, device_id,
+                          self._get_alt_id(dev_clone, "PRE"), dev_clone._id, dev_clone.name)
+
+    def _update_device_clone(self, device_obj, clone_obj):
+        needupdate = False
+        dev_parts = device_obj.name.split("serial# ", 1)
+        clone_parts = clone_obj.name.split("serial# ", 1)
+        if len(dev_parts) > 1:
+            name_stem = dev_parts[0]
+            clone_name_old = clone_obj.name
+            if len(clone_parts) > 1:
+                clone_obj.name = name_stem + "serial# " + clone_parts[1]
+            if clone_obj.name != clone_name_old:
+                needupdate = True
+
+        return needupdate
+
     def _load_PlatformDevice_OOI(self):
         node_objs = self.ooi_loader.get_type_assets("node")
         nodetype_objs = self.ooi_loader.get_type_assets("nodetype")
@@ -2412,6 +2468,7 @@ Reason: %s
                 new_node_ids.add(node_id)
             elif self.ooiupdate:
                 self._update_device(platform_id, newrow, const_id1, const_id2, instrument=False)
+                self._update_clone(self.resource_ids[platform_id], self._update_device_clone)
 
         for node_id, node_obj in node_objs.iteritems():
             if node_id not in new_node_ids:
@@ -2548,6 +2605,7 @@ Reason: %s
                 const_id1 = ooi_id + "_const1"
                 const_id2 = ooi_id + "_const2"
                 self._update_device(newrow[COL_ID], newrow, const_id1, const_id2)
+                self._update_clone(self.resource_ids[ooi_id], self._update_device_clone)
 
     # -------------------------------------------------------------------------
     # Agents
@@ -3428,8 +3486,8 @@ Reason: %s
             if res_obj.description != newrow['dp/description']:
                 res_obj.description = newrow['dp/description']
                 needupdate = True
-            if "dp/reference_urls" in newrow and newrow['dp/reference_urls'] and len(res_obj.reference_urls) != newrow['dp/reference_urls'].split(","):
-                res_obj.reference_urls = newrow['dp/reference_urls'].split(",")
+            if "dp/reference_urls" in newrow and newrow['dp/reference_urls'] and res_obj.reference_urls != eval(newrow['dp/reference_urls']):
+                res_obj.reference_urls = eval(newrow['dp/reference_urls'])
                 needupdate = True
             # Update geospatial bounds if not yet set
             if const_id1 and (not res_obj.geospatial_bounds or not res_obj.geospatial_bounds.geospatial_latitude_limit_north):
@@ -3699,7 +3757,6 @@ Reason: %s
                 newrow['persist_data'] = 'False'
                 if dp_obj['code'] in datalink_objs:
                     newrow['dp/reference_urls'] = repr(datalink_objs[dp_obj['code']].get("DPS", []))
-
                 if instres_obj and instres_obj.serial_number and not "changeme" in instres_obj.serial_number \
                         and not "serial#" in newrow['dp/name']:
                     newrow['dp/name'] = newrow['dp/name'] + " (serial# %s)" % instres_obj.serial_number
