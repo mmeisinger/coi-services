@@ -832,7 +832,9 @@ class DataAcquisitionManagementService(BaseDataAcquisitionManagementService):
         if not process_id:
             raise ServerError("Launched external dataset agent instance but no process_id")
 
-        launcher.await_launch(10.0)
+        # NOTE: This fixed timeout is dangerous. If CEI is busy, it may take longer to slot and start an agent
+        # process. Once the agent comes up, it will register itself in the directory.
+        launcher.await_launch(20.0)
 
         return process_id
 
